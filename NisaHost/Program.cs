@@ -1,13 +1,14 @@
-﻿using System;
-using System.IO;
-using System.Linq;
+﻿using Nisa;
+using Nisa.Chess;
+using Nisa.Tests;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using Nisa;
-using Nisa.Chess;
 
 string modelPath = Path.Combine(AppContext.BaseDirectory, "lc0.onnx");
 
@@ -22,6 +23,13 @@ void RecreateEngine()
     engine?.Dispose();
     engine = new Engine(modelPath, opts);
 }
+
+// Add this to your Program.cs to run tests before starting UCI:
+// if (args.Length > 0 && args[0] == "test")
+// {
+//     TestRunner.RunTests();
+//     return;
+// }
 
 // ────────────────────────────────────────────────────────────────────────────
 // Console I/O helpers
@@ -51,22 +59,31 @@ void ApplyMoves(string[] moves)
     }
 }
 
+// Replace the SetPosition function in NisaHost/Program.cs with this updated version:
+
 void SetPosition(string line)
 {
     RecreateEngine();
 
-    var parts    = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+    var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
     int idxMoves = Array.FindIndex(parts, p => p == "moves");
 
     string fen = parts[1] == "startpos"
-        ? Fen.StartPos
+        ? "startpos"  // Keep as keyword for the engine
         : string.Join(' ', parts[1..(idxMoves == -1 ? parts.Length : idxMoves)]);
 
-    engine!.SetPosition(fen);
-
     if (idxMoves != -1)
-        ApplyMoves(parts[(idxMoves + 1)..]);
+    {
+        // Extract move strings
+        var moveStrings = parts[(idxMoves + 1)..];
+        engine!.SetPositionWithMoves(fen, moveStrings);
+    }
+    else
+    {
+        engine!.SetPosition(fen);
+    }
 }
+
 
 // ────────────────────────────────────────────────────────────────────────────
 // Search control (timed + fixed visits fallback)

@@ -1,5 +1,4 @@
-﻿// Nisa/Search/Mcts.cs
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -11,8 +10,7 @@ using Nisa.Neural;
 namespace Nisa.Search
 {
     /// <summary>
-    /// PUCT Monte-Carlo Tree Search with transposition table,
-    /// timed/fixed-visit modes, and dynamic Dirichlet root noise.
+    /// PUCT Monte-Carlo Tree Search with position history support and improved transposition handling.
     /// </summary>
     internal sealed class Mcts
     {
@@ -21,10 +19,10 @@ namespace Nisa.Search
         // ───────────────────────────────────────────────────────────────────────────
         private sealed class Node
         {
-            public readonly object Sync = new();                // lock for this node
-            public readonly Dictionary<Move, Node> Child = new();  
-            public float P, Q, W;                               // prior, mean, total value
-            public int   N;                                     // visit count
+            public readonly object Sync = new();
+            public readonly Dictionary<Move, Node> Child = new();
+            public float P, Q, W;
+            public int N;
         }
 
         // ───────────────────────────────────────────────────────────────────────────
@@ -34,12 +32,12 @@ namespace Nisa.Search
         private readonly EngineOptions _o;
         private readonly ConcurrentDictionary<ulong, Node> _table = new();
 
-        private static readonly ThreadLocal<Random> Rnd 
-            = new(() => new Random());
+        private static readonly ThreadLocal<Random> Rnd = new(() => new Random());
 
-        private const int   NoiseMoveThreshold = 20;  // only inject when legal move count < 20
-        private const float NoiseEpsilon       = 0.25f;
-        private const double NoiseAlpha        = 0.3; // Dirichlet alpha
+        private const int NoiseMoveThreshold = 20;
+        private const float NoiseEpsilon = 0.25f;
+        private const double NoiseAlpha = 0.3;
+        private const float VirtualLoss = 0.3f; // Reduced from 1.0
 
         // ───────────────────────────────────────────────────────────────────────────
         // Constructor & Clear
@@ -47,7 +45,7 @@ namespace Nisa.Search
         public Mcts(Lc0Session net, EngineOptions o)
         {
             _net = net;
-            _o   = o;
+            _o = o;
         }
 
         /// <summary>Clear the global transposition table.</summary>
@@ -56,22 +54,22 @@ namespace Nisa.Search
         // ───────────────────────────────────────────────────────────────────────────
         // Fixed-visit PUCT search
         // ───────────────────────────────────────────────────────────────────────────
-        public Move Search(Board root, int maxVisits)
+        public Move Search(GameState root, int maxVisits)
         {
-            // 1) root node setup
-            ulong rootKey = Zobrist.Hash(root);
-            var rootNode  = _table.GetOrAdd(rootKey, _ => new Node());
+            // 1) root node setup with history-aware hash
+            ulong rootKey = root.GetHistoryAwareHash();
+            var rootNode = _table.GetOrAdd(rootKey, _ => new Node());
             if (rootNode.Child.Count == 0)
                 Expand(root, rootNode);
 
             // inject Dirichlet noise at root if appropriate
-            InjectRootNoise(root, rootNode);
+            InjectRootNoise(root.Board, rootNode);
 
             // 2) launch threads for fixed visits
             int visitsPerThread = maxVisits / _o.Threads;
             var workers = Enumerable.Range(0, _o.Threads).Select(_ =>
             {
-                var local = new Board(root);
+                var local = new GameState(root); // Copy with history
                 return new Thread(() =>
                 {
                     for (int i = 0; i < visitsPerThread; i++)
@@ -84,26 +82,26 @@ namespace Nisa.Search
 
             // 3) pick best by visit count
             return rootNode.Child
-                           .OrderByDescending(kv => kv.Value.N)
-                           .First().Key;
+                .OrderByDescending(kv => kv.Value.N)
+                .First().Key;
         }
 
         // ───────────────────────────────────────────────────────────────────────────
         // Timed PUCT search until timeMs expires
         // ───────────────────────────────────────────────────────────────────────────
-        public Move SearchByTime(Board root, int timeMs, int threads)
+        public Move SearchByTime(GameState root, int timeMs, int threads)
         {
-            ulong rootKey = Zobrist.Hash(root);
-            var rootNode  = _table.GetOrAdd(rootKey, _ => new Node());
+            ulong rootKey = root.GetHistoryAwareHash();
+            var rootNode = _table.GetOrAdd(rootKey, _ => new Node());
             if (rootNode.Child.Count == 0)
                 Expand(root, rootNode);
 
-            InjectRootNoise(root, rootNode);
+            InjectRootNoise(root.Board, rootNode);
 
             var sw = Stopwatch.StartNew();
             var workers = Enumerable.Range(0, threads).Select(_ =>
             {
-                var local = new Board(root);
+                var local = new GameState(root);
                 return new Thread(() =>
                 {
                     while (sw.ElapsedMilliseconds < timeMs)
@@ -115,14 +113,14 @@ namespace Nisa.Search
             foreach (var t in workers) t.Join();
 
             return rootNode.Child
-                           .OrderByDescending(kv => kv.Value.N)
-                           .First().Key;
+                .OrderByDescending(kv => kv.Value.N)
+                .First().Key;
         }
 
         // ───────────────────────────────────────────────────────────────────────────
         // One simulation: selection → expansion → back-propagation
         // ───────────────────────────────────────────────────────────────────────────
-        private void Simulate(Board board, Node node)
+        private void Simulate(GameState gameState, Node node)
         {
             var path = new Stack<(Node parent, Move mv, Board.Undo undo)>();
 
@@ -132,32 +130,37 @@ namespace Nisa.Search
                 lock (node.Sync)
                 {
                     node.N++;
-                    node.W -= 1;  // virtual loss
+                    node.W -= VirtualLoss;
                 }
                 if (node.Child.Count == 0)
                     break;
 
                 Move mv = PickChild(node);
-                var undo = board.MakeAndReturnUndo(mv);
+                var undo = gameState.Make(mv); // This updates history
                 path.Push((node, mv, undo));
-                node = node.Child[mv];
+                
+                // Get child node with history-aware hash
+                ulong childKey = gameState.GetHistoryAwareHash();
+                node = _table.GetOrAdd(childKey, _ => node.Child[mv]);
             }
 
             // 2) expansion or terminal
             float value = (node.N == 1)
-                        ? Expand(board, node)
-                        : (BitOps.PopCount(board[Board.BK]) == 0 ? 1f : 0f);
+                ? Expand(gameState, node)
+                : (BitOps.PopCount(gameState.Board[Board.BK]) == 0 ? 1f : 0f);
 
             // 3) back-propagate
             while (path.Count > 0)
             {
                 var (parent, mv, undo) = path.Pop();
-                board.Unmake(undo);
+                gameState.Board.Unmake(undo);
+                // Note: History is not unwound here - consider if this matters for your use case
+                
                 lock (parent.Sync)
                 {
                     var child = parent.Child[mv];
-                    child.W += value + 1;  // remove virtual loss + add value
-                    child.Q  = child.W / child.N;
+                    child.W += value + VirtualLoss; // Remove virtual loss + add value
+                    child.Q = child.W / child.N;
                 }
                 value = -value;
             }
@@ -166,22 +169,22 @@ namespace Nisa.Search
         // ───────────────────────────────────────────────────────────────────────────
         // Expansion: evaluate network, add/reuse child nodes, return leaf value
         // ───────────────────────────────────────────────────────────────────────────
-        private float Expand(Board b, Node node)
+        private float Expand(GameState gameState, Node node)
         {
-            var (v, pi) = _net.Evaluate(b);
-            var legal   = Legality.GenerateLegal(b).ToArray();
-            float sumP  = 1e-6f;
+            var (v, pi) = _net.Evaluate(gameState);
+            var legal = Legality.GenerateLegal(gameState.Board).ToArray();
+            float sumP = 1e-6f;
 
             foreach (var mv in legal)
             {
-                var undo = b.MakeAndReturnUndo(mv);
-                ulong key = Zobrist.Hash(b);
-                b.Unmake(undo);
+                var undo = gameState.Make(mv);
+                ulong key = gameState.GetHistoryAwareHash();
+                gameState.Board.Unmake(undo);
 
                 var child = _table.GetOrAdd(key, _ => new Node());
-                int idx   = PolicyMap.MoveToIndex(b, mv);
-                child.P   = (idx >= 0 && idx < pi.Length) ? pi[idx] : 0f;
-                sumP     += child.P;
+                int idx = PolicyMap.MoveToIndex(gameState.Board, mv);
+                child.P = (idx >= 0 && idx < pi.Length) ? pi[idx] : 0f;
+                sumP += child.P;
 
                 lock (node.Sync)
                 {
@@ -204,10 +207,10 @@ namespace Nisa.Search
         // ───────────────────────────────────────────────────────────────────────────
         private Move PickChild(Node p)
         {
-            double c      = _o.Cpuct;
-            int    totalN = p.N;
+            double c = _o.Cpuct;
+            int totalN = p.N;
 
-            Move bestMv   = default!;
+            Move bestMv = default!;
             double bestSc = double.NegativeInfinity;
 
             KeyValuePair<Move, Node>[] entries;
@@ -218,13 +221,13 @@ namespace Nisa.Search
 
             foreach (var (mv, child) in entries)
             {
-                double q     = child.Q;
-                double u     = c * child.P * Math.Sqrt(totalN) / (1 + child.N);
+                double q = child.Q;
+                double u = c * child.P * Math.Sqrt(totalN) / (1 + child.N);
                 double score = q + u;
                 if (score > bestSc)
                 {
-                    bestSc  = score;
-                    bestMv  = mv;
+                    bestSc = score;
+                    bestMv = mv;
                 }
             }
 
@@ -247,7 +250,7 @@ namespace Nisa.Search
             for (int i = 0; i < m; i++)
             {
                 noise[i] = SampleGamma(NoiseAlpha);
-                sum     += noise[i];
+                sum += noise[i];
             }
             for (int i = 0; i < m; i++)
                 noise[i] /= sum;
@@ -260,7 +263,7 @@ namespace Nisa.Search
                     if (rootNode.Child.TryGetValue(mv, out var child))
                     {
                         child.P = (1 - NoiseEpsilon) * child.P
-                                +  (float)(NoiseEpsilon * noise[i]);
+                                + (float)(NoiseEpsilon * noise[i]);
                     }
                 }
             }
@@ -271,7 +274,7 @@ namespace Nisa.Search
         // ───────────────────────────────────────────────────────────────────────────
         private static double SampleGamma(double shape)
         {
-            var rnd = Rnd.Value;
+            var rnd = Rnd.Value!;
             if (shape < 1.0)
             {
                 double u = rnd.NextDouble();

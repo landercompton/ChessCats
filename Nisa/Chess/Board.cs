@@ -200,17 +200,30 @@ namespace Nisa.Chess
         public int KingSquare(bool white) =>
             BitOperations.TrailingZeroCount(_bb[white ? WK : BK]);
 
-        // naive attack detector: iterate enemy piece lists (replace with your own fast mask if you have one already)
+        // In Board.cs, replace the SquareAttackedBy method with this:
+
+        /// <summary>
+        /// Check if a square is attacked by the given side using efficient bitboard attacks.
+        /// </summary>
         public bool SquareAttackedBy(bool attackerWhite, int sq)
         {
-            // very quick & dirty: reuse MoveGen to see if any enemy move hits 'sq'
-            // (good enough for legality; you can optimise later)
-            bool saveSide = WhiteToMove;
-            WhiteToMove = attackerWhite;
-            foreach (var m in MoveGen.Generate(this))
-                if (m.To == sq) { WhiteToMove = saveSide; return true; }
-            WhiteToMove = saveSide;
-            return false;
+            return Attacks.IsSquareAttacked(this, sq, attackerWhite);
+        }
+
+        /// <summary>
+        /// Check if the current side to move is in check.
+        /// </summary>
+        public bool InCheck()
+        {
+            return Attacks.InCheck(this);
+        }
+
+        /// <summary>
+        /// Get all squares attacked by a side.
+        /// </summary>
+        public ulong AttackedSquares(bool byWhite)
+        {
+            return Attacks.GetAllAttacks(this, byWhite);
         }
     }
 }

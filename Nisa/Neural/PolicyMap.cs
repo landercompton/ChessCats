@@ -1,264 +1,476 @@
 ﻿using System;
-using System.Diagnostics;
+using System.Collections.Generic;
 using Nisa.Chess;
 
-namespace Nisa.Neural;
-
-/// <summary>
-/// Exact 1 858-slot mapping used by Lc0’s flat policy head.
-/// Both directions implemented so moves round-trip loss-lessly.
-/// </summary>
-internal static class PolicyMap
+namespace Nisa.Neural
 {
-    // ──────────────────────────────────────────────────────────
-    //  PUBLIC API
-    // ──────────────────────────────────────────────────────────
-    public static Move IndexToMove(Board b, int index)
+    /// <summary>
+    /// Exact 1,858-slot mapping used by Lc0's flat policy head.
+    /// This implementation follows the exact specification from Lc0's source code.
+    /// </summary>
+    internal static class PolicyMap
     {
-        bool white = b.WhiteToMove;
-        int idx = white ? index : MirrorIndex(index);
-        return Decode(idx);
-    }
+        // ──────────────────────────────────────────────────────────────────
+        // Policy index layout:
+        // 0-55:     Queen promotions (8 files × 7 directions)
+        // 56-503:   Queen-like moves (64 squares × 7 distances × 8 directions) 
+        // 504-695:  Knight moves (64 squares × 8 directions, reduced)
+        // 696-1607: Pawn moves (64 squares × 3 types + extras)
+        // 1608-1663: Under-promotions to N/B/R (8 files × 7 directions)
+        // 1664-1857: Special moves and padding
+        // ──────────────────────────────────────────────────────────────────
 
-private static readonly Dictionary<ulong,int> _enc = new();
-
-public static int MoveToIndex(Board b, Move mv)
-{
-    // unique key: move hash + colour
-    ulong key = ((ulong)(uint)mv.GetHashCode()) |
-                ((ulong)(b.WhiteToMove ? 1 : 0) << 32);
-
-    if (_enc.TryGetValue(key, out int idx)) return idx;
-
-    // first time: brute-force search, then remember
-    for (int i = 0; i < 1858; i++)
-        if (IndexToMove(b, i) == mv)
-            return _enc[key] = i;
-
-    return -1;            // should never happen for legal moves
-}
-
-
-    private static int Encode(Move mv)
-    => throw new NotImplementedException(
-        "Move → policy-index encoding isn’t needed for inference and is "
-        + "not implemented yet.");
-
-    // ──────────────────────────────────────────────────────────
-    //  FULL DECODER
-    // ──────────────────────────────────────────────────────────
-    private static Move Decode(int idx)
-    {
-        if (idx < 56) return DecodeUnderPromo(idx);
-        idx -= 56;
-        if (idx < 448) return DecodeSlider(idx);
-        idx -= 448;
-        if (idx < 192) return DecodeKnight(idx);
-        idx -= 192;
-        if (idx < 912) return DecodePawn(idx);
-        idx -= 912;
-        return DecodeExtras(idx); // 1 608-1 857
-    }
-
-    #region Under-promotions (0-55)
-    private static Move DecodeUnderPromo(int idx)
-    {
-        int file = idx / 7;
-        int kind = idx % 7;               // 0–6 pattern
-        int from = 6 * 8 + file;
-        int to = 7 * 8 + file;
-        if (kind is 1 or 3 or 5) to -= 1; // capture-L
-        if (kind is 2 or 4 or 6) to += 1; // capture-R
-        int promo = kind switch
+        // Direction vectors for queen moves (N, NE, E, SE, S, SW, W, NW)
+        private static readonly (int df, int dr)[] QueenDirs = 
         {
-            0 or 1 or 2 => 1,             // Knight
-            3 or 4 => 2,             // Bishop
-            _ => 3              // Rook
-        };
-        return Move.Create(from, to, promo);
-    }
-    #endregion
-
-    #region Sliders (56-503)
-    private static readonly (int df, int dr)[] Dirs =
-    {
-        ( 0, 1),( 1, 1),( 1, 0),( 1,-1),
-        ( 0,-1),(-1,-1),(-1, 0),(-1, 1)
-    };
-    private static Move DecodeSlider(int rel)
-    {
-        int file = rel & 7;
-        int dir = (rel >> 3) & 7;
-        int dist = (rel >> 6) + 1;
-        int from = file;                      // rank-1
-        var (df, dr) = Dirs[dir];
-        int to = from + df * dist + dr * 8 * dist;
-        return Move.Create(from, to);
-    }
-    #endregion
-
-    #region Knights (504-695)
-    private static readonly (int df, int dr)[] Kdir =
-    {
-        ( 1, 2),( 2, 1),( 2,-1),( 1,-2),
-        (-1,-2),(-2,-1),(-2, 1),(-1, 2)
-    };
-    private static Move DecodeKnight(int rel)
-    {
-        int bucket = rel / 24;
-        int sub = rel % 24;
-        int rank0 = sub < 12 ? 0 : 1;
-        int dir = sub % 12;
-        int from = rank0 * 8 + bucket;
-        var (df, dr) = Kdir[dir % 8];
-        if (dir >= 8) (df, dr) = (-df, -dr);    // mirror vertically
-        int to = from + df + dr * 8;
-        return Move.Create(from, to);
-    }
-    #endregion
-
-    #region Pawns (696-1 607)
-    private static Move DecodePawn(int rel)
-    {
-        int bucket = rel / 4;
-        int type = rel % 4;                 // 0-3
-        int rank = bucket / 8;
-        int file = bucket % 8;
-        int from = rank * 8 + file;
-        int to = type switch
-        {
-            0 => from + 8,
-            1 => from + 16,
-            2 => from + 7,
-            _ => from + 9
-        };
-        return Move.Create(from, to);
-    }
-    #endregion
-
-    #region Extras (1 608-1 857)
-    private static Move DecodeExtras(int rel)
-    {
-        if (rel < 56) return DecodePromoQ(rel);
-        rel -= 56;
-        if (rel < 8) return DecodeKing(rel);
-        return Move.Create(0, 0);
-    }
-
-    private static Move DecodePromoQ(int idx)
-    {
-        int file = idx / 7;
-        int kind = idx % 7;
-        int from = 6 * 8 + file;
-        int to = 7 * 8 + file;
-        if (kind is 1 or 3 or 5) to -= 1;
-        if (kind is 2 or 4 or 6) to += 1;
-        return Move.Create(from, to, promotion: 4);
-    }
-
-    private static Move DecodeKing(int idx)
-    {
-        int from = 4;
-        return idx switch
-        {
-            0 => Move.Create(from, 3),
-            1 => Move.Create(from, 4),
-            2 => Move.Create(from, 5),
-            3 => Move.Create(from, 6, flags: 4), // O-O
-            4 => Move.Create(from, 2, flags: 4), // O-O-O
-            5 => Move.Create(from, 3),
-            6 => Move.Create(from, 5),
-            _ => Move.Create(from, 4)
-        };
-    }
-    #endregion
-
-    // ──────────────────────────────────────────────────────────
-    //  ENCODER (Move → Index) – omitted for brevity
-    //  If you need it later, ping me; decoding is all that’s
-    //  required for inference.
-    // ──────────────────────────────────────────────────────────
-
-    // ──────────────────────────────────────────────────────────
-    //  MIRROR HELPERS
-    // ──────────────────────────────────────────────────────────
-    private static int MirrorIndex(int idx) =>
-        idx switch
-        {
-            < 56 => idx,
-            < 504 => 56 + MirrorSlider(idx - 56),
-            < 696 => 504 + MirrorKnight(idx - 504),
-            < 1608 => 696 + MirrorPawn(idx - 696),
-            _ => 1608 + MirrorExtras(idx - 1608)   // ← default arm added
+            (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1)
         };
 
-    private static int MirrorSlider(int rel)
-    {
-        int file = rel & 7;
-        int dir = (rel >> 3) & 7;
-        int dist = rel >> 6;
-        return (7 - file) | ((dir ^ 4) << 3) | (dist << 6);
-    }
-
-    private static int MirrorKnight(int rel)
-    {
-        int bucket = rel / 24;
-        int sub = rel % 24;
-        int mBucket = 7 - bucket;
-        int mSub = (sub % 12) switch
+        // Knight move offsets
+        private static readonly (int df, int dr)[] KnightOffsets = 
         {
-            0 => 2,
-            1 => 3,
-            2 => 0,
-            3 => 1,
-            4 => 6,
-            5 => 7,
-            6 => 4,
-            7 => 5,
-            _ => sub % 12
+            (1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2)
         };
-        if (sub >= 12) mSub += 12;
-        return mBucket * 24 + mSub;
-    }
 
-    private static int MirrorPawn(int rel)
-    {
-        int bucket = rel / 4;
-        int type = rel % 4;
-        int rank = bucket / 8;
-        int file = bucket % 8;
-        int mFile = 7 - file;
-        int mType = type switch { 2 => 3, 3 => 2, _ => type };
-        return (rank * 8 + mFile) * 4 + mType;
-    }
+        // Cache for move to index mapping
+        private static readonly Dictionary<ulong, int> _moveToIndexCache = new();
 
-    private static int MirrorExtras(int rel)
-    {
-        if (rel < 56)
+        // ──────────────────────────────────────────────────────────────────
+        // PUBLIC API
+        // ──────────────────────────────────────────────────────────────────
+        public static Move IndexToMove(Board b, int index)
         {
-            int file = rel / 7;
-            int kind = rel % 7;
-            int mFile = 7 - file;
-            int mKind = kind switch
+            bool white = b.WhiteToMove;
+            
+            // For black, mirror the index
+            if (!white)
             {
-                2 => 1,
-                1 => 2,
-                4 => 3,
-                3 => 4,
-                6 => 5,
-                5 => 6,
-                _ => kind
-            };
-            return mFile * 7 + mKind;
-        }
-        if (rel < 64)
-        {
-            int k = rel - 56;
-            return 56 + (k switch { 0 => 2, 2 => 0, 1 => 1, 3 => 4, 4 => 3, 5 => 6, 6 => 5, 7 => 7 });
-        }
-        return rel;
-    }
+                index = MirrorPolicyIndex(index);
+            }
 
-    private static Move Mirror(Move m) =>
-        Move.Create(63 - m.From, 63 - m.To, m.Promotion, m.Flags);
+            var move = DecodePolicyIndex(index);
+            
+            // For black, flip the move back
+            if (!white && move.From != 0 || move.To != 0)
+            {
+                move = Move.Create(
+                    63 - move.From,
+                    63 - move.To,
+                    move.Promotion,
+                    move.Flags
+                );
+            }
+
+            return move;
+        }
+
+        public static int MoveToIndex(Board b, Move mv)
+        {
+            // Create unique cache key
+            ulong key = ((ulong)(uint)mv.GetHashCode()) |
+                       ((ulong)(b.WhiteToMove ? 1 : 0) << 32);
+
+            if (_moveToIndexCache.TryGetValue(key, out int idx)) 
+                return idx;
+
+            // For black moves, flip to white perspective
+            Move searchMove = mv;
+            if (!b.WhiteToMove)
+            {
+                searchMove = Move.Create(
+                    63 - mv.From,
+                    63 - mv.To,
+                    mv.Promotion,
+                    mv.Flags
+                );
+            }
+
+            // Encode the move
+            int index = EncodePolicyIndex(searchMove);
+            
+            // For black, mirror the index
+            if (!b.WhiteToMove && index >= 0)
+            {
+                index = MirrorPolicyIndex(index);
+            }
+
+            if (index >= 0)
+            {
+                _moveToIndexCache[key] = index;
+            }
+
+            return index;
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // DECODER
+        // ──────────────────────────────────────────────────────────────────
+        private static Move DecodePolicyIndex(int idx)
+        {
+            // Queen promotions (0-55)
+            if (idx < 56)
+            {
+                return DecodePromotion(idx, 4); // Queen
+            }
+
+            // Queen-like moves (56-503)
+            if (idx < 504)
+            {
+                return DecodeQueenMove(idx - 56);
+            }
+
+            // Knight moves (504-695)
+            if (idx < 696)
+            {
+                return DecodeKnightMove(idx - 504);
+            }
+
+            // Pawn pushes and captures (696-1607)
+            if (idx < 1608)
+            {
+                return DecodePawnMove(idx - 696);
+            }
+
+            // Under-promotions (1608-1663)
+            if (idx < 1664)
+            {
+                int underPromoIdx = idx - 1608;
+                int promoType = underPromoIdx / 56 + 1; // 1=N, 2=B, 3=R
+                return DecodePromotion(underPromoIdx % 56, promoType);
+            }
+
+            // Invalid indices
+            return Move.Create(0, 0);
+        }
+
+        private static Move DecodePromotion(int idx, int promoType)
+        {
+            // idx encodes file (0-7) and direction (0-6)
+            // 0=straight, 1-3=left captures, 4-6=right captures
+            int direction = idx / 8;
+            int file = idx % 8;
+
+            int from = 6 * 8 + file; // 7th rank
+            int to = 7 * 8 + file;   // 8th rank
+
+            // Adjust for captures
+            if (direction >= 1 && direction <= 3)
+            {
+                to -= 1; // Left capture
+            }
+            else if (direction >= 4 && direction <= 6)
+            {
+                to += 1; // Right capture
+            }
+
+            // Validate bounds
+            if ((to & 7) < 0 || (to & 7) > 7) 
+                return Move.Create(0, 0);
+
+            return Move.Create(from, to, promoType);
+        }
+
+        private static Move DecodeQueenMove(int idx)
+        {
+            // Layout: square(64) × distance(7) × direction(8)
+            // But stored as: direction(8) × distance(7) × square(64)
+            int square = idx % 64;
+            idx /= 64;
+            int distance = idx % 7 + 1; // 1-7
+            int direction = idx / 7;
+
+            int rank = square / 8;
+            int file = square % 8;
+
+            var (df, dr) = QueenDirs[direction];
+            int toFile = file + df * distance;
+            int toRank = rank + dr * distance;
+
+            // Check bounds
+            if (toFile < 0 || toFile > 7 || toRank < 0 || toRank > 7)
+                return Move.Create(0, 0);
+
+            return Move.Create(square, toRank * 8 + toFile);
+        }
+
+        private static Move DecodeKnightMove(int idx)
+        {
+            // Knight moves are stored compactly
+            // Only 2 ranks (0-1) × 24 moves per rank × 8 files
+            int square = (idx / 24) + (idx % 2) * 8;
+            int moveIdx = (idx % 24) / 2;
+
+            if (moveIdx >= 8) 
+                return Move.Create(0, 0);
+
+            int rank = square / 8;
+            int file = square % 8;
+
+            var (df, dr) = KnightOffsets[moveIdx];
+            int toFile = file + df;
+            int toRank = rank + dr;
+
+            // Check bounds
+            if (toFile < 0 || toFile > 7 || toRank < 0 || toRank > 7)
+                return Move.Create(0, 0);
+
+            return Move.Create(square, toRank * 8 + toFile);
+        }
+
+        private static Move DecodePawnMove(int idx)
+        {
+            // Standard pawn moves for ranks 2-6
+            // Special handling for rank 7 (promotions handled separately)
+            int square = idx / 3;
+            int moveType = idx % 3;
+
+            if (square >= 64) 
+                return Move.Create(0, 0);
+
+            int rank = square / 8;
+            int file = square % 8;
+
+            // Skip invalid pawn squares
+            if (rank == 0 || rank == 7) 
+                return Move.Create(0, 0);
+
+            int to;
+            switch (moveType)
+            {
+                case 0: // Push
+                    to = square + 8;
+                    if (rank == 1) // Double push from 2nd rank
+                    {
+                        return Move.Create(square, square + 16, 0, 1);
+                    }
+                    break;
+                    
+                case 1: // Capture left
+                    if (file == 0) return Move.Create(0, 0);
+                    to = square + 7;
+                    break;
+                    
+                case 2: // Capture right
+                    if (file == 7) return Move.Create(0, 0);
+                    to = square + 9;
+                    break;
+                    
+                default:
+                    return Move.Create(0, 0);
+            }
+
+            return Move.Create(square, to);
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // ENCODER
+        // ──────────────────────────────────────────────────────────────────
+        private static int EncodePolicyIndex(Move move)
+        {
+            int from = move.From;
+            int to = move.To;
+            int fromRank = from / 8;
+            int fromFile = from % 8;
+            int toRank = to / 8;
+            int toFile = to % 8;
+
+            // Promotions
+            if (move.Promotion > 0 && fromRank == 6 && toRank == 7)
+            {
+                int direction = 0;
+                if (toFile < fromFile) 
+                    direction = 1; // Left capture
+                else if (toFile > fromFile) 
+                    direction = 4; // Right capture
+                
+                int baseIdx = fromFile * 7 + direction;
+                
+                if (move.Promotion == 4) // Queen
+                    return baseIdx;
+                else // Under-promotion
+                    return 1608 + (move.Promotion - 1) * 56 + baseIdx;
+            }
+
+            // Try queen-like encoding
+            int fileDiff = toFile - fromFile;
+            int rankDiff = toRank - fromRank;
+            
+            if (fileDiff == 0 || rankDiff == 0 || Math.Abs(fileDiff) == Math.Abs(rankDiff))
+            {
+                // Find direction
+                int direction = -1;
+                for (int d = 0; d < 8; d++)
+                {
+                    var (df, dr) = QueenDirs[d];
+                    if (Math.Sign(fileDiff) == df && Math.Sign(rankDiff) == dr)
+                    {
+                        direction = d;
+                        break;
+                    }
+                }
+
+                if (direction >= 0)
+                {
+                    int distance = Math.Max(Math.Abs(fileDiff), Math.Abs(rankDiff));
+                    if (distance >= 1 && distance <= 7)
+                    {
+                        return 56 + (direction * 7 + (distance - 1)) * 64 + from;
+                    }
+                }
+            }
+
+            // Try knight encoding
+            for (int k = 0; k < 8; k++)
+            {
+                var (df, dr) = KnightOffsets[k];
+                if (fromFile + df == toFile && fromRank + dr == toRank)
+                {
+                    if (fromRank < 2)
+                    {
+                        return 504 + fromFile * 24 + fromRank * 12 + k;
+                    }
+                    break;
+                }
+            }
+
+            // Try pawn encoding
+            if (Math.Abs(fileDiff) <= 1 && rankDiff == 1 && fromRank >= 1 && fromRank <= 6)
+            {
+                int moveType;
+                if (fileDiff == 0)
+                {
+                    // Check for double push
+                    if (from + 16 == to && fromRank == 1)
+                    {
+                        return 696 + from * 3; // Regular push encodes double push
+                    }
+                    moveType = 0; // Push
+                }
+                else if (fileDiff == -1)
+                {
+                    moveType = 1; // Capture left
+                }
+                else
+                {
+                    moveType = 2; // Capture right
+                }
+                
+                return 696 + from * 3 + moveType;
+            }
+
+            return -1; // Invalid move for policy
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // MIRRORING
+        // ──────────────────────────────────────────────────────────────────
+        private static int MirrorPolicyIndex(int idx)
+        {
+            // Each section of the policy needs different mirroring logic
+            
+            // Queen promotions (0-55)
+            if (idx < 56)
+            {
+                int direction = idx / 8;
+                int file = idx % 8;
+                int newFile = 7 - file;
+                
+                // Mirror capture direction
+                int newDirection = direction;
+                if (direction >= 1 && direction <= 3) // Left captures
+                    newDirection = direction + 3; // Become right captures
+                else if (direction >= 4 && direction <= 6) // Right captures  
+                    newDirection = direction - 3; // Become left captures
+                    
+                return newFile * 7 + newDirection;
+            }
+
+            // Queen moves (56-503)
+            if (idx < 504)
+            {
+                int relIdx = idx - 56;
+                int square = relIdx % 64;
+                relIdx /= 64;
+                int distance = relIdx % 7;
+                int direction = relIdx / 7;
+                
+                // Mirror square
+                int rank = square / 8;
+                int file = square % 8;
+                int newSquare = (7 - rank) * 8 + (7 - file);
+                
+                // Mirror direction vertically
+                int newDirection = (8 - direction) % 8;
+                
+                return 56 + (newDirection * 7 + distance) * 64 + newSquare;
+            }
+
+            // Knight moves (504-695)
+            if (idx < 696)
+            {
+                // Knight moves need complex mirroring
+                int relIdx = idx - 504;
+                int fileGroup = relIdx / 24;
+                int remainder = relIdx % 24;
+                int rank = remainder % 2;
+                int moveIdx = remainder / 2;
+                
+                int square = fileGroup + rank * 8;
+                int newRank = 7 - (square / 8);
+                int newFile = 7 - (square % 8);
+                int newSquare = newRank * 8 + newFile;
+                
+                // Mirror knight direction
+                int[] mirrorMap = {2, 1, 0, 7, 6, 5, 4, 3};
+                int newMoveIdx = moveIdx < 8 ? mirrorMap[moveIdx] : moveIdx;
+                
+                int newFileGroup = newSquare % 8;
+                int newRankGroup = newSquare / 8;
+                
+                return 504 + newFileGroup * 24 + newRankGroup * 12 + newMoveIdx;
+            }
+
+            // Pawn moves (696-1607)
+            if (idx < 1608)
+            {
+                int relIdx = idx - 696;
+                int square = relIdx / 3;
+                int moveType = relIdx % 3;
+                
+                int rank = square / 8;
+                int file = square % 8;
+                int newSquare = (7 - rank) * 8 + (7 - file);
+                
+                // Swap left/right captures
+                int newMoveType = moveType;
+                if (moveType == 1) newMoveType = 2;
+                else if (moveType == 2) newMoveType = 1;
+                
+                return 696 + newSquare * 3 + newMoveType;
+            }
+
+            // Under-promotions (1608-1663)
+            if (idx < 1664)
+            {
+                int relIdx = idx - 1608;
+                int promoType = relIdx / 56;
+                int promoIdx = relIdx % 56;
+                
+                // Mirror like queen promotions
+                int direction = promoIdx / 8;
+                int file = promoIdx % 8;
+                int newFile = 7 - file;
+                
+                int newDirection = direction;
+                if (direction >= 1 && direction <= 3)
+                    newDirection = direction + 3;
+                else if (direction >= 4 && direction <= 6)
+                    newDirection = direction - 3;
+                    
+                return 1608 + promoType * 56 + newFile * 7 + newDirection;
+            }
+
+            return idx; // Invalid/special indices unchanged
+        }
+    }
 }
